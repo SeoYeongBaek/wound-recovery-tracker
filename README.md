@@ -27,32 +27,15 @@ Mask R-CNN은 각 상처에 고유 인스턴스 ID를 부여해 개별 회복 �
 
 ## 파이프라인
 
-```
-입력 이미지 (시계열: Day 0, 2, 5, 7, 10, 14, ...)
-       │
-       ▼
-┌──────────────────────────────────────┐
-│  전처리 (Data.ipynb)                  │
-│  · 마스크 면적 계산 및 순위화          │
-│  · 80케이스 의사 시계열 구성           │
-│    (Normal 50 / Plateau 15 / Rebound 15) │
-└────────────────┬─────────────────────┘
-                 │
-                 ▼
-┌──────────────────────────────────────┐
-│  Mask R-CNN 파인튜닝 (Mask_RCNN_Kaggle.ipynb) │
-│  · ResNet-50 FPN 백본 freeze         │
-│  · 500장 스마트 샘플링 + 10 epoch     │
-│  · 후처리: Morphological closing/opening │
-└────────────────┬─────────────────────┘
-                 │  예측 마스크 + 인스턴스 면적(px)
-                 ▼
-┌──────────────────────────────────────┐
-│  RVI 산출 & 패턴 분류 (RVI_Analysis_Kaggle.ipynb) │
-│  · RVI (Recovery Velocity Index) 0~100점 │
-│  · Normal / Plateau / Rebound 자동 분류 │
-│  · 회복 곡선 그래프 + Confusion Matrix  │
-└──────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["입력 이미지\n시계열: Day 0, 2, 5, 7, 10, 14 ..."] --> B
+
+    B["전처리\nData.ipynb\n\n· 마스크 면적 계산 및 순위화\n· 80케이스 의사 시계열 구성\n  Normal 50 / Plateau 15 / Rebound 15"]
+
+    B --> C["Mask R-CNN 파인튜닝\nMask_RCNN_Kaggle.ipynb\n\n· ResNet-50 FPN 백본 freeze\n· 500장 스마트 샘플링 + 10 epoch\n· 후처리: Morphological closing / opening"]
+
+    C -->|"예측 마스크 + 인스턴스 면적(px)"| D["RVI 산출 & 패턴 분류\nRVI_Analysis_Kaggle.ipynb\n\n· RVI 0~100점 산출\n· Normal / Plateau / Rebound 자동 분류\n· 회복 곡선 그래프 + Confusion Matrix"]
 ```
 
 ---
