@@ -1,0 +1,22 @@
+# 데이터셋 (용량 초과)
+data_wound_seg/
+
+# 모델 가중치 (100MB 초과)
+*.pth
+*.pt
+*.ckpt
+
+# Claude Code 내부 파일
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# 환경
+.env
+*.egg-info/
+dist/
+build/
