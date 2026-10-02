@@ -57,6 +57,9 @@ flowchart TD
 | Rebound | 15 | **100%** | 60.4 | Day 18 |
 | **전체** | **80** | **92.5%** | — | — |
 
+> 평균 안정화일은 이전 정의(구간 변화율이 처음 5% 미만이 되는 날)로 측정한 값이다.
+> 현재 정의(아래 "안정화일" 참고)로 바꿨으므로 `RVI_Analysis_Kaggle.ipynb`를 다시 실행해 갱신해야 한다.
+
 ---
 
 ## 핵심 구현
@@ -72,9 +75,19 @@ $$\text{RVI} = \text{clip}\left(\frac{A_0 - A_{\text{last}}}{A_0} \times \frac{1
 
 | 패턴 | 판별 조건 |
 |------|-----------|
-| Rebound | 중간 구간(Day 3~15)에서 면적이 5% 이상 증가한 타임포인트 존재 |
+| Rebound | 중간 구간(첫·마지막 구간 제외, 7시점 기준 Day 3→15)에서 면적이 5% 초과 증가 |
 | Plateau | 후반 3구간(Day 9→18) 변화율이 모두 10% 미만 |
 | Normal | 위 두 조건 미해당 |
+
+시점이 3개뿐이면 중간 구간이 없으므로 모든 구간에서 rebound를 검사한다.
+앱과 노트북은 같은 구현(`wound/analysis.py`)을 사용한다.
+
+### 안정화일
+
+상처 면적이 **초기 면적의 5% 이하**가 되는 첫 날.
+- 측정값이 이미 기준 이하 → 해당 측정일 (관측)
+- 아직 도달 전 → 지수 감소 피팅(시점 3개 이상) 또는 선형 추세로 외삽 (추정)
+- 마지막 측정일 + 180일 안에 도달하지 않으면 "미도달"
 
 ### 학습 전략
 
@@ -91,7 +104,14 @@ wound-recovery/
 ├── Data.ipynb                         # 데이터 전처리 + 의사 시계열 생성
 ├── Mask_RCNN_Kaggle.ipynb             # 모델 학습 및 추론 (Kaggle T4)
 ├── RVI_Analysis_Kaggle.ipynb          # RVI 산출 + 패턴 분류 + 시각화
-├── app.py                             # 데모 애플리케이션
+├── app.py                             # 데모 애플리케이션 (Streamlit)
+├── wound/                             # 앱·노트북 공통 모듈
+│   ├── config.py                      #   임계값 / 입력 크기 등 공통 상수
+│   ├── postprocess.py                 #   마스크 후처리
+│   ├── metrics.py                     #   IoU / Dice / Precision / Recall
+│   ├── analysis.py                    #   RVI / 패턴 분류 / 안정화일
+│   └── model.py                       #   Mask R-CNN 구성 / 로드 / 추론
+├── tests/                             # pytest 단위 테스트
 ├── mask_rcnn_wound_final.pth          # 학습된 모델 가중치
 │
 └── data_wound_seg/
@@ -115,6 +135,14 @@ wound-recovery/
 pip install torch torchvision opencv-python numpy pandas matplotlib scikit-learn scipy
 ```
 
+노트북은 `wound/` 모듈을 import 한다. 로컬에서는 저장소 루트에서 실행하면 되고,
+Kaggle에서는 저장소를 받은 뒤 경로를 `WOUND_REPO_DIR` 환경변수로 지정한다
+(기본값 `/kaggle/working/wound-recovery-tracker`).
+
+```bash
+!git clone https://github.com/SeoYeongBaek/wound-recovery-tracker.git /kaggle/working/wound-recovery-tracker
+```
+
 ### Step 1 — 데이터 전처리 (로컬)
 
 `Data.ipynb` 실행
@@ -134,6 +162,23 @@ pip install torch torchvision opencv-python numpy pandas matplotlib scikit-learn
 `RVI_Analysis_Kaggle.ipynb` 실행
 - 시계열 면적 추출 → RVI 산출 (0~100점) → 패턴 분류
 - 출력: 회복 곡선 그래프, RVI 분포 박스플롯, Confusion Matrix
+
+### 데모 앱
+
+```bash
+pip install -r requirements_app.txt
+WOUND_MODEL_PATH=/path/to/mask_rcnn_wound_final.pth streamlit run app.py
+```
+
+`WOUND_MODEL_PATH`를 지정하지 않으면 프로젝트 폴더 → `~/Downloads` → `~` 순서로 가중치 파일을 찾는다.
+**의료 진단 도구가 아니다.**
+
+### 테스트
+
+```bash
+pip install pytest
+pytest
+```
 
 ---
 

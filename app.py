@@ -14,28 +14,30 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
-import torch
-import torchvision
 from PIL import Image
-from scipy.optimize import curve_fit
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+from wound import model as wound_model
+from wound.analysis import (
+    STABLE_EXTRAPOLATED,
+    STABLE_NOT_REACHED,
+    STABLE_OBSERVED,
+    classify_pattern,
+    compute_rvi,
+    estimate_stable_day,
+)
+from wound.config import MAX_INSTANCES, RESIZE_TO, STABLE_HORIZON_DAYS, STABLE_RATIO
 
 # ─────────────────────────────────────────────
 #  Config
 # ─────────────────────────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATE_PATHS = [
+    os.environ.get("WOUND_MODEL_PATH", ""),                            # 환경변수 지정
     os.path.join(_SCRIPT_DIR, "mask_rcnn_wound_final.pth"),           # 프로젝트 폴더
     os.path.expanduser("~/Downloads/mask_rcnn_wound_final.pth"),       # 다운로드 폴더
     os.path.expanduser("~/mask_rcnn_wound_final.pth"),                  # 홈 폴더
 ]
-MODEL_PATH = next((p for p in _CANDIDATE_PATHS if os.path.exists(p)), _CANDIDATE_PATHS[0])
-NUM_CLASSES = 2
-RESIZE_TO   = 512
-SCORE_THR     = 0.5
-MASK_THR      = 0.5
-MAX_INSTANCES = 5   # 이미지 한 장당 최대 검출 인스턴스 수
+MODEL_PATH = next((p for p in _CANDIDATE_PATHS if p and os.path.exists(p)), _CANDIDATE_PATHS[1])
 
 # 인스턴스별 오버레이 색상 (BGR → RGB 변환 후 사용)
 INSTANCE_COLORS_RGB = [
@@ -45,11 +47,6 @@ INSTANCE_COLORS_RGB = [
     (200, 180,   0),   # #4 노랑
     (180,  40, 180),   # #5 마젠타
 ]
-
-REBOUND_THR = 0.05
-PLATEAU_THR = 0.10
-STABLE_THR  = 0.05
-REF_DAYS    = 14
 
 PATTERN_COLORS = {
     "normal":  "#2ecc71",
@@ -88,43 +85,30 @@ _setup_korean_font()
 # ─────────────────────────────────────────────
 @st.cache_resource(show_spinner="모델 로딩 중...")
 def load_model(model_path: str):
-    """학습된 Mask R-CNN 모델을 로드하고 반환."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=None, weights_backbone=None)
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, 256, NUM_CLASSES)
-
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state)
-    model.to(device)
-    model.eval()
-    return model, device
+    """학습된 Mask R-CNN 모델을 로드하고 (model, device) 반환."""
+    return wound_model.load_model(model_path)
 
 
 # ─────────────────────────────────────────────
 #  Inference helpers
 # ─────────────────────────────────────────────
-def postprocess_mask(bin_mask: np.ndarray,
-                     k_close: int = 7, k_open: int = 3,
-                     min_area: int = 200) -> np.ndarray:
-    """Morphological closing/opening + 소형 컴포넌트 제거."""
-    m = (bin_mask * 255).astype(np.uint8)
-    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
-    ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open,  k_open))
-    m  = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kc)
-    m  = cv2.morphologyEx(m, cv2.MORPH_OPEN,  ko)
-    m  = (m > 0).astype(np.uint8)
-    if min_area > 0:
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-        out = np.zeros_like(m)
-        for i in range(1, num):
-            if stats[i, cv2.CC_STAT_AREA] >= min_area:
-                out[labels == i] = 1
-        m = out
-    return m
+def draw_instance_overlay(rgb: np.ndarray, instance_masks: list) -> np.ndarray:
+    """인스턴스별 색상 오버레이 + 번호 레이블을 그린 RGB 이미지 반환."""
+    overlay = rgb.astype(np.float32)
+    for i, mask in enumerate(instance_masks):
+        color = np.array(INSTANCE_COLORS_RGB[i % len(INSTANCE_COLORS_RGB)], dtype=np.float32)
+        region = mask.astype(bool)
+        overlay[region] = overlay[region] * 0.4 + color * 0.6
+    overlay_rgb = np.clip(overlay, 0, 255).astype(np.uint8)
+
+    # 인스턴스 번호 레이블 (색상 블렌딩 이후 최종 이미지 위에 직접 그린다)
+    for i, mask in enumerate(instance_masks):
+        ys, xs = np.nonzero(mask)
+        if len(xs) > 0:
+            cx, cy = int(xs.mean()), int(ys.mean())
+            cv2.putText(overlay_rgb, f"#{i+1}", (cx - 10, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return overlay_rgb
 
 
 def run_inference(model, device, pil_image: Image.Image):
@@ -141,29 +125,9 @@ def run_inference(model, device, pil_image: Image.Image):
         num_instances (int): 검출된 인스턴스 수
         instance_areas (list[int]): 인스턴스별 면적 리스트
     """
-    bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    bgr = cv2.resize(bgr, (RESIZE_TO, RESIZE_TO), interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    img_t = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0).to(device)
-
-    with torch.inference_mode():
-        out = model([img_t])[0]
-
-    scores_np  = out.get("scores", torch.tensor([])).cpu().numpy()
-    masks_tens = out.get("masks", None)
-
-    # ── 인스턴스별 마스크 분리 수집 ──
-    instance_masks = []
-    instance_areas = []
-
-    if len(scores_np) > 0 and masks_tens is not None:
-        keep_idx = np.where(scores_np >= SCORE_THR)[0][:MAX_INSTANCES]
-        for ki in keep_idx:
-            m = (masks_tens[ki, 0].cpu().numpy() > MASK_THR).astype(np.uint8)
-            m = postprocess_mask(m)
-            if m.sum() > 0:
-                instance_masks.append(m)
-                instance_areas.append(int(m.sum()))
+    rgb = cv2.resize(np.array(pil_image), (RESIZE_TO, RESIZE_TO), interpolation=cv2.INTER_AREA)
+    instance_masks, _ = wound_model.predict_instances(model, device, rgb)
+    instance_areas = [int(m.sum()) for m in instance_masks]
 
     # 전체 마스크: 인스턴스 union
     if instance_masks:
@@ -171,108 +135,9 @@ def run_inference(model, device, pil_image: Image.Image):
     else:
         pred_bin = np.zeros((RESIZE_TO, RESIZE_TO), dtype=np.uint8)
 
-    # ── 인스턴스별 색상 오버레이 ──
-    overlay = rgb.copy().astype(np.float32)
-    for i, mask in enumerate(instance_masks):
-        color = np.array(INSTANCE_COLORS_RGB[i % len(INSTANCE_COLORS_RGB)], dtype=np.float32)
-        region = mask.astype(bool)
-        overlay[region] = overlay[region] * 0.4 + color * 0.6
-        # 인스턴스 번호 레이블
-        ys, xs = np.where(region)
-        if len(xs) > 0:
-            cx, cy = int(xs.mean()), int(ys.mean())
-            cv2.putText(overlay.astype(np.uint8), f"#{i+1}", (cx - 10, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-    overlay_rgb = np.clip(overlay, 0, 255).astype(np.uint8)
+    overlay_rgb = draw_instance_overlay(rgb, instance_masks)
     wound_area  = int(pred_bin.sum())
     return pred_bin, overlay_rgb, wound_area, len(instance_masks), instance_areas
-
-
-# ─────────────────────────────────────────────
-#  Analysis helpers
-# ─────────────────────────────────────────────
-def classify_pattern(areas: list) -> str:
-    """
-    시계열 면적으로 치유 패턴 분류 (Normal / Plateau / Rebound).
-    최소 3개 데이터 포인트 필요.
-    """
-    if len(areas) < 3:
-        return "unknown"
-    n = len(areas)
-    # Rebound: 어느 구간이든 면적 5% 이상 증가 (area=0인 구간은 직전 값 기준)
-    for i in range(0, n - 1):
-        ref = areas[i] if areas[i] > 0 else (areas[i - 1] if i > 0 else 0)
-        if ref > 0 and (areas[i + 1] - areas[i]) / ref > REBOUND_THR:
-            return "rebound"
-    # Plateau: 후반 min(3, n-1)개 구간 변화율 모두 10% 미만
-    late_idx_start = max(0, n - 4)
-    late_changes = []
-    for i in range(late_idx_start, n - 1):
-        if areas[i] > 0:
-            late_changes.append(abs(areas[i + 1] - areas[i]) / areas[i])
-    if late_changes and all(c < PLATEAU_THR for c in late_changes):
-        return "plateau"
-    return "normal"
-
-
-def compute_rvi(areas: list, days: list) -> float:
-    """RVI(Recovery Velocity Index, 0~100) 계산."""
-    if len(areas) < 2 or areas[0] <= 0:
-        return 0.0
-    a0, a_last = areas[0], areas[-1]
-    t_elapsed = days[-1] - days[0]
-    if t_elapsed <= 0:
-        return 0.0
-    total_reduction = (a0 - a_last) / a0
-    rvi = total_reduction / t_elapsed * REF_DAYS * 100
-    return float(np.clip(rvi, 0, 100))
-
-
-def estimate_stable_day(areas: list, days: list) -> tuple[int, str]:
-    """
-    안정화 예상일 추정.
-
-    Returns:
-        (day_estimate, method_label)
-        method_label: 'observed' | 'extrapolated' | 'unknown'
-    """
-    if len(areas) < 2:
-        return days[-1], "unknown"
-
-    # 이미 안정화된 경우: 마지막 변화율 < STABLE_THR
-    for i in range(len(areas) - 1):
-        if areas[i] > 0 and abs(areas[i + 1] - areas[i]) / areas[i] < STABLE_THR:
-            return days[i + 1], "observed"
-
-    # 지수 감소 피팅으로 외삽
-    try:
-        def exp_decay(t, a, b, c):
-            return a * np.exp(-b * t) + c
-
-        a0 = float(areas[0])
-        p0 = [a0, 0.05, a0 * 0.05]
-        popt, _ = curve_fit(
-            exp_decay, days, areas,
-            p0=p0, maxfev=5000,
-            bounds=([0, 1e-6, 0], [a0 * 10, 2, a0]),
-        )
-        # 안정화 기준: 초기 면적의 5% 이하
-        target = a0 * 0.05
-        # day를 연속적으로 탐색
-        for d in range(days[-1], days[-1] + 180):
-            if exp_decay(d, *popt) <= target:
-                return d, "extrapolated"
-        return days[-1] + 180, "extrapolated"
-
-    except Exception:
-        # 선형 외삽 fallback
-        if len(areas) >= 2:
-            rate = (areas[-1] - areas[-2]) / max(1, days[-1] - days[-2])
-            if rate < 0:
-                days_to_stable = (areas[-1] - areas[0] * 0.05) / (-rate)
-                return int(days[-1] + max(0, days_to_stable)), "extrapolated"
-        return days[-1], "unknown"
 
 
 # ─────────────────────────────────────────────
@@ -301,7 +166,7 @@ def get_instance_series(records_sorted: list) -> list:
 # ─────────────────────────────────────────────
 #  Plot helpers
 # ─────────────────────────────────────────────
-def make_recovery_curve(records: list, stable_day: int, stable_method: str,
+def make_recovery_curve(records: list, stable_day, stable_method: str,
                         pattern: str) -> plt.Figure:
     """
     회복 곡선 matplotlib Figure 생성.
@@ -319,14 +184,14 @@ def make_recovery_curve(records: list, stable_day: int, stable_method: str,
             markersize=7, label="측정값")
 
     # 안정화 기준선
-    ax.axhline(0.05, color="#7f8c8d", linestyle=":", linewidth=1.2,
-               label="안정화 기준 (5%)")
+    ax.axhline(STABLE_RATIO, color="#7f8c8d", linestyle=":", linewidth=1.2,
+               label=f"안정화 기준 ({STABLE_RATIO:.0%})")
 
     # 안정화 예상일 수직선
-    if stable_method != "unknown":
+    if stable_day is not None:
         ax.axvline(stable_day, color="#e67e22", linestyle="--", linewidth=1.5,
                    label=f"안정화 예상: Day {stable_day}"
-                         + (" (관측)" if stable_method == "observed" else " (추정)"))
+                         + (" (관측)" if stable_method == STABLE_OBSERVED else " (추정)"))
 
     ax.set_xlabel("Day", fontsize=12)
     ax.set_ylabel("정규화 면적 (Day 0 기준)", fontsize=12)
@@ -366,6 +231,10 @@ def main():
         "상처 이미지를 날짜 순으로 업로드하면, "
         "Mask R-CNN이 상처 면적을 분석하고 **예상 안정화일**을 알려줍니다."
     )
+    st.warning(
+        "⚠️ 이 앱은 컴퓨터 비전 파이프라인 학습용 데모이며 **의료 진단 도구가 아닙니다.** "
+        "분석 결과를 진단이나 치료 판단에 사용하지 말고, 상처 상태는 반드시 의료진과 상담하세요."
+    )
     st.divider()
 
     # ── 모델 경로 확인 ───────────────────────
@@ -374,7 +243,7 @@ def main():
         st.error(
             f"모델 파일을 찾을 수 없습니다: `{active_model_path}`\n\n"
             "Kaggle에서 다운로드한 `mask_rcnn_wound_final.pth`를 "
-            "이 스크립트와 같은 폴더에 넣거나, 사이드바에서 직접 업로드하세요."
+            "이 스크립트와 같은 폴더에 넣거나, 환경변수 `WOUND_MODEL_PATH`로 경로를 지정하세요."
         )
         st.stop()
 
@@ -392,10 +261,10 @@ def main():
         day_input = st.number_input(
             "촬영일 (Day)", min_value=0, max_value=365, value=0, step=1,
         )
-        analyze_btn = st.button("분석 추가", type="primary", use_container_width=True)
+        analyze_btn = st.button("분석 추가", type="primary", width="stretch")
 
         st.divider()
-        if st.button("초기화 (새 케이스)", use_container_width=True):
+        if st.button("초기화 (새 케이스)", width="stretch"):
             st.session_state.records = []
             st.rerun()
 
@@ -455,7 +324,7 @@ def main():
 
     with col_img:
         st.subheader(f"최신 상처 마스크 (Day {latest['day']})")
-        st.image(latest["overlay"], use_container_width=True, clamp=True)
+        st.image(latest["overlay"], width="stretch", clamp=True)
         n_inst = latest.get("num_instances", 1)
         inst_areas = latest.get("instance_areas", [latest["area"]])
         if n_inst >= 2:
@@ -470,10 +339,7 @@ def main():
         pattern = classify_pattern(areas)
         rvi     = compute_rvi(areas, days)
 
-        if len(records_sorted) >= 2:
-            stable_day, stable_method = estimate_stable_day(areas, days)
-        else:
-            stable_day, stable_method = days[-1], "unknown"
+        stable_day, stable_method = estimate_stable_day(areas, days)
 
         # 패턴 배지
         badge_color = PATTERN_COLORS.get(pattern, "#95a5a6")
@@ -489,11 +355,16 @@ def main():
         m1.metric("RVI (회복 속도 지수)", f"{rvi:.1f} / 100")
         m2.metric("데이터 포인트", f"{len(records_sorted)}개")
 
-        if stable_method != "unknown":
-            label = "✅ 관측" if stable_method == "observed" else "📊 추정"
+        if stable_method in (STABLE_OBSERVED, STABLE_EXTRAPOLATED):
+            label = "✅ 관측" if stable_method == STABLE_OBSERVED else "📊 추정"
             st.success(
                 f"**예상 안정화일: Day {stable_day}** {label}\n\n"
-                f"(초기 면적의 5% 이하로 감소하는 시점)"
+                f"(초기 면적의 {STABLE_RATIO:.0%} 이하로 감소하는 시점)"
+            )
+        elif stable_method == STABLE_NOT_REACHED:
+            st.warning(
+                f"현재 추세로는 마지막 측정일 이후 {STABLE_HORIZON_DAYS}일 안에 "
+                f"안정화 기준(초기 면적의 {STABLE_RATIO:.0%} 이하)에 도달하지 않을 것으로 보입니다."
             )
         else:
             st.warning(
@@ -515,7 +386,7 @@ def main():
         st.divider()
         st.subheader("📈 회복 곡선")
         fig = make_recovery_curve(records_sorted, stable_day, stable_method, pattern)
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, width="stretch")
         plt.close(fig)
 
         with st.expander("📊 상세 회복 곡선 분석", expanded=False):
@@ -560,20 +431,19 @@ def main():
                 inst_areas = inst["areas"]
                 inst_pattern = classify_pattern(inst_areas)
                 inst_rvi     = compute_rvi(inst_areas, inst_days)
-                if len(records_sorted) >= 2:
-                    inst_stable_day, inst_stable_method = estimate_stable_day(inst_areas, inst_days)
-                else:
-                    inst_stable_day, inst_stable_method = inst_days[-1], "unknown"
+                inst_stable_day, inst_stable_method = estimate_stable_day(inst_areas, inst_days)
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("패턴", PATTERN_KR.get(inst_pattern, "?"))
                 c2.metric("RVI", f"{inst_rvi:.1f} / 100")
-                if inst_stable_method != "unknown":
+                if inst_stable_day is not None:
                     c3.metric("예상 안정화일", f"Day {inst_stable_day}")
+                elif inst_stable_method == STABLE_NOT_REACHED:
+                    c3.metric("예상 안정화일", f"{STABLE_HORIZON_DAYS}일 내 미도달")
 
                 inst_records = [{"day": d, "area": a} for d, a in zip(inst_days, inst_areas)]
                 fig = make_recovery_curve(inst_records, inst_stable_day, inst_stable_method, inst_pattern)
-                st.pyplot(fig, use_container_width=True)
+                st.pyplot(fig, width="stretch")
                 plt.close(fig)
 
     # ── 업로드된 전체 이미지 히스토리 ─────────
@@ -584,7 +454,7 @@ def main():
         for col, r in zip(cols, records_sorted):
             with col:
                 st.image(r["overlay"], caption=f"Day {r['day']} | {r['area']:,} px",
-                         use_container_width=True)
+                         width="stretch")
 
 
 if __name__ == "__main__":
